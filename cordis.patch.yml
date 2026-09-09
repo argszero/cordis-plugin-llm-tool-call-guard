@@ -1,0 +1,16 @@
+# The @argszero/cordis-plugin-llm-tool-call-guard bundle patch: no deployment-
+# specific config is needed to mount (maxArgsBytes=24576, fail=true by default).
+# Tune via a profile layer if desired:
+#
+#   - set:
+#       - id: llm-tool-call-guard
+#         config:
+#           maxArgsBytes: 8192
+#           fail: true
+#
+# The guard only cuts a single tool call whose streamed arguments exceed the
+# per-call byte budget; every other chunk passes through byte-for-byte.
+
+- insert:
+    - id: llm-tool-call-guard
+      name: '@argszero/cordis-plugin-llm-tool-call-guard'
