@@ -20,6 +20,15 @@
  *   2. emits a synthesized terminal `error` finish with a stable
  *      `TOOL_CALL_ARGUMENTS_TOO_LARGE` failure.
  *
+ * An optional whole-request budget (`maxTotalArgsBytes`, default 0 = off) bounds
+ * the *cumulative* arguments across every tool-call block in one stream. This is
+ * a distinct failure shape from the per-call guard: a model can legitimately
+ * keep every call under `maxArgsBytes` yet issue many of them until the sum
+ * consumes the entire response output budget. When the total exceeds
+ * `maxTotalArgsBytes`, the guard cuts the source and emits a terminal
+ * `TOOL_CALL_ARGUMENTS_TOTAL_TOO_LARGE` failure instead of letting the stream run
+ * to `max-tokens`.
+ *
  * Boundary honesty — what this genuinely does (verified against
  * `packages/core/agent-loop/src/agent.ts` on dsh 0.1.5-alpha.1):
  *  - The agent loop branches on the finish reason *before* it filters the
@@ -62,6 +71,13 @@ export interface Config {
      */
     maxArgsBytes?: number;
     /**
+     * Maximum *cumulative* `argumentsDelta` bytes across all tool-call blocks in
+     * one stream (whole-request budget). Default `0` (off): only the per-call
+     * guard applies. When the sum of every call's arguments exceeds this budget,
+     * the stream is cut and terminated with `TOOL_CALL_ARGUMENTS_TOTAL_TOO_LARGE`.
+     */
+    maxTotalArgsBytes?: number;
+    /**
      * When `true` (default), on breach emit a terminal `error` finish that the
      * agent loop routes to `agent/request-error` (never executes the call).
      * Set `false` to observe-only: cut the source but forward a normal `stop`
@@ -74,15 +90,28 @@ export type ResolvedConfig = Required<Config>;
 export declare const Config: z<Config>;
 /** Default per-call argument budget in bytes. */
 export declare const DEFAULT_MAX_ARGS_BYTES = 24576;
-/** Stable machine-routing code for the breach. */
+/** Default whole-request aggregate budget in bytes (`0` = off). */
+export declare const DEFAULT_MAX_TOTAL_ARGS_BYTES = 0;
+/** Stable machine-routing code for the per-call breach. */
 export declare const BREACH_CODE = "TOOL_CALL_ARGUMENTS_TOO_LARGE";
+/** Stable machine-routing code for the whole-request aggregate breach. */
+export declare const BREACH_TOTAL_CODE = "TOOL_CALL_ARGUMENTS_TOTAL_TOO_LARGE";
 /**
- * The Failure emitted at the breach. Exported so tests (and the core author's
- * draft) can assert on the exact stable shape.
+ * The Failure emitted at the per-call breach. Exported so tests (and the core
+ * author's draft) can assert on the exact stable shape.
  */
 export declare function breachFailure(index: number, bytes: number, limit: number): LlmFailure;
-/** The terminal finish emitted at the breach. */
+/**
+ * The Failure emitted at the whole-request aggregate breach. Distinct code so a
+ * consumer can tell "one call was too big" from "the sum of many calls was too
+ * big" — the fixes differ (raise a per-call cap vs. reduce how many calls the
+ * model issues).
+ */
+export declare function breachTotalFailure(totalBytes: number, limit: number): LlmFailure;
+/** The terminal finish emitted at the per-call breach. */
 export declare function breachFinish(index: number, bytes: number, limit: number): FinishReason;
+/** The terminal finish emitted at the whole-request aggregate breach. */
+export declare function breachTotalFinish(totalBytes: number, limit: number): FinishReason;
 /**
  * The guard. Returns the upstream stream, or a cut stream that emits up to and
  * including the breaching chunk then a terminal `error` finish.

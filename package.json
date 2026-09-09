@@ -1,7 +1,7 @@
 {
   "name": "@argszero/cordis-plugin-llm-tool-call-guard",
-  "description": "Runaway tool-call argument guard for dsh: wrap the llm/stream waterfall and cut a tool call that streams more than a configurable number of arguments bytes, terminating with a routed TOOL_CALL_ARGUMENTS_TOO_LARGE error finish so the oversized call is never executed. Compatible with dsh 0.1.5-alpha.1 (agent loop never executes a tool-call when the stream ends on an error/aborted finish).",
-  "version": "0.1.0",
+  "description": "Runaway tool-call argument guard for dsh: wrap the llm/stream waterfall and cut a tool call that streams more than a configurable number of arguments bytes, terminating with a routed TOOL_CALL_ARGUMENTS_TOO_LARGE error finish so the oversized call is never executed. Also supports a whole-request aggregate budget (maxTotalArgsBytes) that bounds the cumulative arguments across all tool-call blocks. Compatible with dsh 0.1.5-alpha.1 (agent loop never executes a tool-call when the stream ends on an error/aborted finish).",
+  "version": "0.1.1",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

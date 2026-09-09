@@ -22,6 +22,11 @@ malformed) call is either executed or silently discarded. This is discussion **#
   consuming the upstream generator (releasing the provider connection and the still-growing
   arguments stream) and emits a **synthesized terminal `error` finish** with the stable
   failure code `TOOL_CALL_ARGUMENTS_TOO_LARGE`.
+- Optionally counts the **whole-request aggregate** `argumentsDelta` across *every* tool-call
+  block in one stream (`maxTotalArgsBytes`, default `0` = off). When the sum exceeds that
+  budget it cuts the source and emits a terminal `error` finish with the distinct failure
+  code `TOOL_CALL_ARGUMENTS_TOTAL_TOO_LARGE` — a different failure shape from the per-call
+  guard (one call too big vs. too many calls).
 - The agent loop branches on the finish reason **before** it filters assistant content for
   tool-call blocks, so an `error` finish routes to `agent/request-error` and **never executes**
   the oversized call. `llm-invariant` explicitly allows an error/aborted finish to carry open
@@ -58,6 +63,7 @@ Tune via config:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `maxArgsBytes` | `24576` | Max accumulated `argumentsDelta` bytes per tool-call block index. `0` disables the guard (pure pass-through). |
+| `maxTotalArgsBytes` | `0` | Max *cumulative* `argumentsDelta` bytes across all tool-call blocks in one stream (whole-request budget). `0` disables the aggregate guard. |
 | `fail` | `true` | On breach, emit a terminal `error` finish (routes to `agent/request-error`, call not executed). `false` = observe-only: cut the source but emit a normal `stop` finish (partial call treated normally). |
 
 ## License
