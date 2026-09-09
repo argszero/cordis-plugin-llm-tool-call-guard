@@ -5,11 +5,16 @@
 #   - set:
 #       - id: llm-tool-call-guard
 #         config:
-#           maxArgsBytes: 8192
+#           maxArgsBytes: 8192        # per-call byte budget
+#           maxArgsFragments: 1024    # per-call fragment budget (default 0=off)
+#           maxTotalArgsBytes: 32768  # whole-request aggregate budget (default 0=off)
 #           fail: true
 #
-# The guard only cuts a single tool call whose streamed arguments exceed the
-# per-call byte budget; every other chunk passes through byte-for-byte.
+# The guard cuts a single tool call whose streamed arguments exceed the per-call
+# byte budget (maxArgsBytes), or that emits too many tool-call-delta fragments
+# (maxArgsFragments — the #6059 fragment-count runaway), or when the cumulative
+# arguments across all calls exceed maxTotalArgsBytes. Every other chunk passes
+# through byte-for-byte.
 
 - insert:
     - id: llm-tool-call-guard

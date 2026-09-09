@@ -29,6 +29,14 @@
  * `TOOL_CALL_ARGUMENTS_TOTAL_TOO_LARGE` failure instead of letting the stream run
  * to `max-tokens`.
  *
+ * A per-call **fragment budget** (`maxArgsFragments`, default 0 = off) bounds the
+ * number of `tool-call-delta` fragments emitted for one tool call. Bytes and
+ * fragments measure different runaway shapes: the #6059 recorded stream
+ * (4,074 deltas, 4,658 bytes over ~115s) is a *fragment-count* runaway that a
+ * byte budget alone never fires. When an index exceeds `maxArgsFragments`, the
+ * guard cuts the source and emits a terminal
+ * `TOOL_CALL_ARGUMENTS_TOO_MANY_FRAGMENTS` failure.
+ *
  * Boundary honesty — what this genuinely does (verified against
  * `packages/core/agent-loop/src/agent.ts` on dsh 0.1.5-alpha.1):
  *  - The agent loop branches on the finish reason *before* it filters the
@@ -64,17 +72,32 @@ export declare const inject: string[];
 /** Plugin configuration. */
 export interface Config {
     /**
-     * Maximum accumulated `argumentsDelta` bytes allowed for one tool call
-     * (per block index). Default 24 KiB (24576). Set to `0` to disable the guard
-     * entirely (pass-through). A call whose arguments exceed this budget is cut
-     * and the stream terminated with `TOOL_CALL_ARGUMENTS_TOO_LARGE`.
+     * Maximum accumulated `argumentsDelta` **UTF-8 bytes** allowed for one tool
+     * call (per block index). Default 24 KiB (24576). Set to `0` to disable the
+     * byte guard. A call whose arguments exceed this budget is cut and the stream
+     * terminated with `TOOL_CALL_ARGUMENTS_TOO_LARGE`.
+     *
+     * UTF-8 bytes (not UTF-16 code units) since the docs and the option name say
+     * "bytes". `argumentsDelta` is a JS string (`length` counts UTF-16 units), so
+     * non-ASCII arguments would be under-counted by `.length`; we use
+     * `utf8Length()` consistently.
      */
     maxArgsBytes?: number;
     /**
-     * Maximum *cumulative* `argumentsDelta` bytes across all tool-call blocks in
-     * one stream (whole-request budget). Default `0` (off): only the per-call
-     * guard applies. When the sum of every call's arguments exceeds this budget,
-     * the stream is cut and terminated with `TOOL_CALL_ARGUMENTS_TOTAL_TOO_LARGE`.
+     * Maximum number of `tool-call-delta` **fragments** emitted for one tool call
+     * (per block index). Default `0` (off). The real incident this guard targets
+     * (discussion #6059 recorded stream) is a *fragment-count runaway*: 4,074
+     * deltas over ~115s totaling only 4,658 bytes — a byte budget alone never
+     * fires. A per-index fragment cap catches it while leaving byte limits free
+     * to reject truly large payloads at their own threshold.
+     */
+    maxArgsFragments?: number;
+    /**
+     * Maximum *cumulative* `argumentsDelta` **UTF-8 bytes** across all tool-call
+     * blocks in one stream (whole-request budget). Default `0` (off): only the
+     * per-call guard applies. When the sum of every call's arguments exceeds this
+     * budget, the stream is cut and terminated with
+     * `TOOL_CALL_ARGUMENTS_TOTAL_TOO_LARGE`.
      */
     maxTotalArgsBytes?: number;
     /**
@@ -88,14 +111,20 @@ export interface Config {
 /** Resolved config: every field carries its validated default. */
 export type ResolvedConfig = Required<Config>;
 export declare const Config: z<Config>;
-/** Default per-call argument budget in bytes. */
+/** Default per-call argument budget in UTF-8 bytes. */
 export declare const DEFAULT_MAX_ARGS_BYTES = 24576;
-/** Default whole-request aggregate budget in bytes (`0` = off). */
+/** Default per-call argument fragment budget (`0` = off). */
+export declare const DEFAULT_MAX_ARGS_FRAGMENTS = 0;
+/** Default whole-request aggregate budget in UTF-8 bytes (`0` = off). */
 export declare const DEFAULT_MAX_TOTAL_ARGS_BYTES = 0;
-/** Stable machine-routing code for the per-call breach. */
+/** Stable machine-routing code for the per-call byte breach. */
 export declare const BREACH_CODE = "TOOL_CALL_ARGUMENTS_TOO_LARGE";
+/** Stable machine-routing code for the per-call fragment-count breach. */
+export declare const BREACH_FRAGMENTS_CODE = "TOOL_CALL_ARGUMENTS_TOO_MANY_FRAGMENTS";
 /** Stable machine-routing code for the whole-request aggregate breach. */
 export declare const BREACH_TOTAL_CODE = "TOOL_CALL_ARGUMENTS_TOTAL_TOO_LARGE";
+/** UTF-8 byte length of an ASCII/Unicode string (never counts UTF-16 units). */
+export declare function utf8Length(value: string): number;
 /**
  * The Failure emitted at the per-call breach. Exported so tests (and the core
  * author's draft) can assert on the exact stable shape.
@@ -112,6 +141,15 @@ export declare function breachTotalFailure(totalBytes: number, limit: number): L
 export declare function breachFinish(index: number, bytes: number, limit: number): FinishReason;
 /** The terminal finish emitted at the whole-request aggregate breach. */
 export declare function breachTotalFinish(totalBytes: number, limit: number): FinishReason;
+/**
+ * The Failure emitted at the per-call fragment-count breach. Distinct code so a
+ * consumer can tell "this call streamed too many arguments bytes" from "this
+ * call emitted too many fragments" — the fixes differ (the #6059 incident is a
+ * fragment-count runaway: 4,074 deltas but only 4,658 bytes).
+ */
+export declare function breachFragmentsFailure(index: number, fragments: number, limit: number): LlmFailure;
+/** The terminal finish emitted at the per-call fragment-count breach. */
+export declare function breachFragmentsFinish(index: number, fragments: number, limit: number): FinishReason;
 /**
  * The guard. Returns the upstream stream, or a cut stream that emits up to and
  * including the breaching chunk then a terminal `error` finish.

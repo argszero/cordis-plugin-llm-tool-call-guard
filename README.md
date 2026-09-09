@@ -2,9 +2,9 @@
 
 Runaway tool-call argument guard for the **dsh** harness (deepseek-harness). It wraps
 the [`llm/stream`](https://deepseek-ai.github.io/deepseek-harness/) waterfall and cuts a
-single tool call that streams **more than a configurable number of arguments bytes**,
-terminating the stream with a routed `TOOL_CALL_ARGUMENTS_TOO_LARGE` error finish **so the
-oversized call is never executed**.
+single tool call that streams **more than a configurable number of arguments bytes** (or
+**fragments**), terminating the stream with a routed error finish so the oversized call is
+**never executed**.
 
 ## Why
 
@@ -16,17 +16,21 @@ malformed) call is either executed or silently discarded. This is discussion **#
 
 ## What it does
 
-- Counts the accumulated `argumentsDelta` bytes **per tool-call block index** (a model can
-  interleave several calls, so the budget applies to each call independently).
+- Counts the accumulated `argumentsDelta` **UTF-8 bytes** per tool-call block index (a model
+  can interleave several calls, so the budget applies to each call independently).
 - When one call's arguments exceed `maxArgsBytes` (default **24576** = 24 KiB), it stops
   consuming the upstream generator (releasing the provider connection and the still-growing
   arguments stream) and emits a **synthesized terminal `error` finish** with the stable
   failure code `TOOL_CALL_ARGUMENTS_TOO_LARGE`.
+- Optionally counts the **number of `tool-call-delta` fragments** per call index
+  (`maxArgsFragments`, default `0` = off). Bytes and fragments measure *different* runaway
+  shapes: the recorded #6059 stream is 4,074 deltas but only 4,658 bytes — a **fragment-count
+  runaway** that a byte budget alone never fires. When an index exceeds `maxArgsFragments` it
+  cuts the source and emits the distinct code `TOOL_CALL_ARGUMENTS_TOO_MANY_FRAGMENTS`.
 - Optionally counts the **whole-request aggregate** `argumentsDelta` across *every* tool-call
   block in one stream (`maxTotalArgsBytes`, default `0` = off). When the sum exceeds that
-  budget it cuts the source and emits a terminal `error` finish with the distinct failure
-  code `TOOL_CALL_ARGUMENTS_TOTAL_TOO_LARGE` — a different failure shape from the per-call
-  guard (one call too big vs. too many calls).
+  budget it cuts the source and emits the distinct code `TOOL_CALL_ARGUMENTS_TOTAL_TOO_LARGE`
+  — a different failure shape from the per-call guard (one call too big vs. too many calls).
 - The agent loop branches on the finish reason **before** it filters assistant content for
   tool-call blocks, so an `error` finish routes to `agent/request-error` and **never executes**
   the oversized call. `llm-invariant` explicitly allows an error/aborted finish to carry open
@@ -54,17 +58,33 @@ Tune via config:
 - set:
     - id: llm-tool-call-guard
       config:
-        maxArgsBytes: 8192   # per-call argument budget (byte); 0 disables
-        fail: true            # emit error finish (never execute the oversized call)
+        maxArgsBytes: 8192        # per-call argument budget (byte); 0 disables
+        maxArgsFragments: 1024    # per-call fragment budget (count); 0 disables
+        maxTotalArgsBytes: 32768  # whole-request aggregate budget (byte); 0 disables
+        fail: true                 # emit error finish (never execute the oversized call)
 ```
 
 ## Config
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `maxArgsBytes` | `24576` | Max accumulated `argumentsDelta` bytes per tool-call block index. `0` disables the guard (pure pass-through). |
-| `maxTotalArgsBytes` | `0` | Max *cumulative* `argumentsDelta` bytes across all tool-call blocks in one stream (whole-request budget). `0` disables the aggregate guard. |
+| `maxArgsBytes` | `24576` | Max accumulated `argumentsDelta` **UTF-8 bytes** per tool-call block index. `0` disables the byte guard. |
+| `maxArgsFragments` | `0` | Max number of `tool-call-delta` **fragments** per tool-call block index. `0` disables the fragment guard. Catches the #6059 fragment-count runaway that a byte budget alone misses. |
+| `maxTotalArgsBytes` | `0` | Max *cumulative* `argumentsDelta` **UTF-8 bytes** across all tool-call blocks in one stream (whole-request budget). `0` disables the aggregate guard. |
 | `fail` | `true` | On breach, emit a terminal `error` finish (routes to `agent/request-error`, call not executed). `false` = observe-only: cut the source but emit a normal `stop` finish (partial call treated normally). |
+
+## UTF-8 byte counting
+
+The guard counts `argumentsDelta` in **UTF-8 bytes** (via `TextEncoder`), matching the option
+name and docs. It does **not** use `.length`, which counts UTF-16 code units and would
+under-count non-ASCII arguments (e.g. `'中'` is 3 bytes but 1 code unit).
+
+## Regression fixture
+
+The test suite includes a **boundary-exact recorded stream** from discussion #6059: 4,074
+`tool-call-delta` fragments / 4,658 bytes / histogram `{ 1: 3492, 2: 581, 4: 1 }`, supplied by
+`@luisnomad`. The fixture asserts the byte-only guard passes it unchanged (the blind spot) while
+the fragment guard correctly catches it.
 
 ## License
 
