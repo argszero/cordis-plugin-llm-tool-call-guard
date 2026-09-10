@@ -35,6 +35,8 @@ malformed) call is either executed or silently discarded. This is discussion **#
   tool-call blocks, so an `error` finish routes to `agent/request-error` and **never executes**
   the oversized call. `llm-invariant` explicitly allows an error/aborted finish to carry open
   block indexes, so the finish is protocol-legal.
+- **Repairs a tool call that streams an empty identity** (`repair`, default `'repair'`) — the
+  `{"id":"","name":""}` shape behind discussion **#6152**. See [Empty tool-call identity](#empty-tool-call-identity-6152) below.
 - Every chunk under the budget passes through **byte-for-byte**; only the breaching call is cut.
 
 ## Install / mount
@@ -72,6 +74,50 @@ Tune via config:
 | `maxArgsFragments` | `0` | Max number of `tool-call-delta` **fragments** per tool-call block index. `0` disables the fragment guard. Catches the #6059 fragment-count runaway that a byte budget alone misses. |
 | `maxTotalArgsBytes` | `0` | Max *cumulative* `argumentsDelta` **UTF-8 bytes** across all tool-call blocks in one stream (whole-request budget). `0` disables the aggregate guard. |
 | `fail` | `true` | On breach, emit a terminal `error` finish (routes to `agent/request-error`, call not executed). `false` = observe-only: cut the source but emit a normal `stop` finish (partial call treated normally). |
+| `repair` | `'repair'` | What to do with an **empty tool-call identity** (#6152): `'repair'` substitutes a deterministic synthetic call id, `'error'` cuts the stream with `TOOL_CALL_EMPTY_IDENTITY`, `'off'` preserves v0.1.3 exactly. |
+| `repairBytes` | `true` | With `repair: 'repair'`, also substitute `{}` for an empty `argumentsDelta` on the repaired call. Only the block's first delta is inspected, so this can only affect a genuinely identity-less block. |
+
+## Empty tool-call identity (#6152)
+
+A model — observed with an OpenAI-completions-style provider — can emit a tool call whose
+identity is blank:
+
+```json
+{"type": "tool-call", "id": "", "name": "", "arguments": "{}"}
+```
+
+The harness persists that as-is, and the **next** load rejects the stored `tool/result`
+(`assertMessageEventShape` requires a non-empty `source.callId`). The whole conversation is
+then marked corrupt and the session can no longer be started or resumed; recovery means
+hand-patching the `.jsonl.zstd` frame container.
+
+The asymmetry is worth stating precisely, because it explains why no existing layer caught
+it: the validator that rejects the event **already exists** and is called from the *read*
+boundary and the seed path — but `Session.append` never calls it. The OpenAI-completions
+adapter emits `''` as a deliberate "id not yet seen" sentinel, and the assembler's
+`?? 'call-N'` fallback never fires on it because `''` is not `undefined`.
+
+This plugin sits on the producer-side seam (`llm/stream`), so it can close the gap before the
+event is persisted:
+
+- **`repair: 'repair'`** (default) rewrites the empty id to a deterministic
+  `repaired-call-<index>` on **both** the `tool-call-delta` chunks and the `block-end` block.
+  Repairing only the deltas would be a silent no-op, because the core assembler treats
+  `block-end` as authoritative and overwrites the accumulated values.
+- An empty **`name`** is deliberately left alone. The harness already turns it into a
+  `ToolNotFoundError` / `UNKNOWN_TOOL` error result, which is an honest and *resumable*
+  outcome. Blanking the name would make the call vanish; inventing a plausible one would
+  fabricate a call the model never requested.
+- **`repair: 'error'`** cuts the stream with a terminal `error` finish (code
+  `TOOL_CALL_EMPTY_IDENTITY`), so the degenerate call is never executed at all.
+- **`repair: 'off'`** preserves v0.1.3 behaviour byte-for-byte.
+
+Every repaired block is reported **once** at `warn` level, naming the field(s) that were
+empty. That is deliberate: "nothing was visible" is the heart of the #6152 report.
+
+> **Scope.** This is a mitigation at the producer seam, not the authoritative fix. A plugin
+> cannot prevent the append — the write boundary needs its own check. Reported upstream in
+> [#6152](https://github.com/deepseek-ai/deepseek-harness/discussions/6152).
 
 ## UTF-8 byte counting
 
