@@ -69,6 +69,10 @@ import z from '@deepseek-ai/schemastery'
 // `llm/stream` event to Cordis' Context.Events, and provides StreamChunk /
 // LlmFailure / FinishReason / GenerateOptions types.
 import type { FinishReason, GenerateOptions, LlmFailure, StreamChunk } from '@deepseek-ai/dsh-llm'
+// Value import: the branded `ToolCallId` constructor the harness itself uses
+// when it synthesizes a call id (`llm/src/assembler.ts`). Reusing it keeps a
+// repaired id indistinguishable in *type* from a provider-issued one.
+import { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'llm-tool-call-guard'
@@ -114,6 +118,28 @@ export interface Config {
    * finish (the assembled partial call is then treated as a normal tool call).
    */
   fail?: boolean
+  /**
+   * What to do when a tool call streams an **empty identity** — an empty `id`,
+   * an empty `name`, or both (discussion #6152). One of `'repair'` (default),
+   * `'error'`, or `'off'`.
+   *
+   * `'repair'` substitutes a deterministic synthetic id so the call is
+   * loadable, and lets an empty `name` through: the harness already turns that
+   * into a `ToolNotFoundError` / `UNKNOWN_TOOL` result, which is a correct and
+   * *resumable* outcome. `repairBytes` additionally substitutes `{}` for empty
+   * arguments. `'error'` cuts the stream with an `error` finish instead, so the
+   * degenerate call is never executed (the same routing the byte/fragment
+   * guards use). `'off'` preserves v0.1.3 behaviour exactly.
+   */
+  repair?: 'repair' | 'error' | 'off'
+  /**
+   * With `repair: 'repair'`, also substitute `{}` for an empty
+   * `argumentsDelta` on a tool-call at the moment its identity is repaired.
+   * Default `true`. Only the block's *first* delta is inspected, so this can
+   * only fire on a genuinely identity-less block. Set `false` to keep the
+   * argument stream byte-for-byte identical.
+   */
+  repairBytes?: boolean
 }
 
 /** Resolved config: every field carries its validated default. */
@@ -124,6 +150,8 @@ export const Config: z<Config> = z.object({
   maxArgsFragments: z.number().min(0).default(0),
   maxTotalArgsBytes: z.number().min(0).default(0),
   fail: z.boolean().default(true),
+  repair: z.union(['repair', 'error', 'off']).default('repair'),
+  repairBytes: z.boolean().default(true),
 })
 
 /** Default per-call argument budget in UTF-8 bytes. */
@@ -143,6 +171,24 @@ export const BREACH_FRAGMENTS_CODE = 'TOOL_CALL_ARGUMENTS_TOO_MANY_FRAGMENTS'
 
 /** Stable machine-routing code for the whole-request aggregate breach. */
 export const BREACH_TOTAL_CODE = 'TOOL_CALL_ARGUMENTS_TOTAL_TOO_LARGE'
+
+/** Stable machine-routing code for a tool call that streamed no identity. */
+export const BREACH_IDENTITY_CODE = 'TOOL_CALL_EMPTY_IDENTITY'
+
+/**
+ * Deterministic synthetic id for a tool call that streamed an empty `id`.
+ *
+ * Determinism matters: the same broken stream must repair to the same id on
+ * every replay, because the durable log, its `tool/call`+`tool/result` pair, and
+ * the session-format migration predicates all key on the call id. A random or
+ * time-based id would make the log non-reproducible and could not be matched to
+ * the `toolCallId` the result already carries.
+ * @param index - the block index of the identity-less call.
+ * @returns a branded tool-call id.
+ */
+export function syntheticCallId(index: number): ToolCallId {
+  return ToolCallId(`repaired-call-${index}`)
+}
 
 /** UTF-8 byte length of an ASCII/Unicode string (never counts UTF-16 units). */
 export function utf8Length(value: string): number {
@@ -219,6 +265,140 @@ export function breachFragmentsFinish(index: number, fragments: number, limit: n
 }
 
 /**
+ * The Failure emitted when `repair: 'error'` cuts an identity-less tool call.
+ * Distinct code so an operator can tell "the model emitted a nameless call"
+ * from "the call was too large" — the causes and the fixes are unrelated.
+ */
+export function breachIdentityFailure(index: number, missing: readonly string[]): LlmFailure {
+  return {
+    message:
+      `tool-call at index ${index} streamed an empty ${missing.join(' and empty ')}; ` +
+      'the call cannot be identified or dispatched',
+    code: BREACH_IDENTITY_CODE,
+  }
+}
+
+/** The terminal finish emitted at the empty-identity breach. */
+export function breachIdentityFinish(index: number, missing: readonly string[]): FinishReason {
+  return { kind: 'error', failure: breachIdentityFailure(index, missing) }
+}
+
+/**
+ * Repair (or reject) tool calls that stream an **empty identity**.
+ *
+ * A call whose `id` is `''` is the shape behind discussion #6152: the
+ * OpenAI-completions adapter emits `''` as a *designed* sentinel for "id not
+ * seen yet" (`llm-pi-ai/src/stream.ts`), the assembler's `?? 'call-N'` fallback
+ * never fires because `''` is not `undefined` (`llm/src/assembler.ts`), and the
+ * session write boundary does not re-check `source.callId` — so the degenerate
+ * chain is persisted, and the *read* boundary then rejects it, marking the whole
+ * session corrupt and unstartable.
+ *
+ * This guard repairs the two places the id must satisfy, because the assembler
+ * treats `block-end` as authoritative and overwrites the accumulated deltas:
+ *
+ *  - every `tool-call-delta` for the block carries the synthetic id, so the
+ *    fallback path (delta-only protocols, interrupted blocks) is also safe; and
+ *  - the `block-end`'s own `tool-call` block carries it too, so the assembled
+ *    message matches its `tool/result` (`toolCallId === source.callId`).
+ *
+ * An empty `name` is deliberately *left alone* in `'repair'` mode: the harness
+ * already converts it into a `ToolNotFoundError` / `UNKNOWN_TOOL` error result,
+ * which is an honest, resumable outcome. Blanking the name would make the call
+ * vanish; inventing a plausible one would fabricate a call the model never
+ * asked for.
+ *
+ * @param source - the upstream chunk stream.
+ * @param config - resolved plugin config.
+ * @param onRepair - called once per affected block index, with the fields that
+ *   were empty. Kept as a parameter so the generator stays pure and log-free
+ *   for tests; the plugin passes a `ctx.logger.warn` delegate.
+ * @returns a stream with identity-less tool calls repaired, rejected, or passed
+ *   through unchanged when `repair: 'off'`.
+ */
+export async function* repairIdentityStream(
+  source: AsyncIterable<StreamChunk>,
+  config: ResolvedConfig,
+  onRepair?: (index: number, missing: readonly string[]) => void,
+): AsyncIterable<StreamChunk> {
+  if (config.repair === 'off') {
+    for await (const chunk of source) yield chunk
+    return
+  }
+
+  // Blocks already repaired (or reported), keyed by block index. A block's
+  // identity is decided once: later deltas inherit the decision rather than
+  // re-reporting the same defect on every fragment.
+  const repaired = new Map<number, ToolCallId>()
+  const reported = new Set<number>()
+
+  for await (const chunk of source) {
+    if (chunk.type === 'tool-call-delta') {
+      const emptyId = chunk.id === ''
+      // `name` is optional on the wire; an *absent* name is not the #6152 shape
+      // (the assembler synthesizes it), so only a present-but-empty name counts.
+      const emptyName = Object.hasOwn(chunk, 'name') && chunk.name === ''
+
+      if (emptyId || emptyName) {
+        const missing = [
+          ...emptyId ? ['id'] : [],
+          ...emptyName ? ['name'] : [],
+        ]
+        if (config.repair === 'error') {
+          yield chunk
+          yield { type: 'finish', reason: breachIdentityFinish(chunk.index, missing) }
+          return
+        }
+        if (!reported.has(chunk.index)) {
+          reported.add(chunk.index)
+          // Repair is otherwise silent, and #6152 is exactly a case of "nobody
+          // could see what the model emitted". One line per affected block.
+          onRepair?.(chunk.index, missing)
+        }
+        if (emptyId && !repaired.has(chunk.index)) repaired.set(chunk.index, syntheticCallId(chunk.index))
+        yield {
+          ...chunk,
+          ...emptyId ? { id: repaired.get(chunk.index) as ToolCallId } : {},
+          // Substituting `{}` for empty args makes the call look like every
+          // other zero-argument call and keeps it out of the way of adapters
+          // that fail closed on unparseable/blank argument strings.
+          ...config.repairBytes && chunk.argumentsDelta === '' && missing.length > 0
+            ? { argumentsDelta: '{}' }
+            : {},
+        }
+        continue
+      }
+
+      // A later delta for an already-repaired block still needs the synthetic id
+      // carried forward — the adapter may re-emit `''` on every fragment.
+      const known = repaired.get(chunk.index)
+      yield known === undefined ? chunk : { ...chunk, id: known }
+      continue
+    }
+
+    if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+      const block = chunk.block
+      const repairedId = repaired.get(chunk.index)
+      if (block.id === '' || repairedId !== undefined) {
+        // The block-end wins over the deltas, so this is the copy that actually
+        // reaches the durable log; it must carry the repaired id.
+        yield {
+          ...chunk,
+          block: {
+            ...block,
+            id: block.id === '' ? syntheticCallId(chunk.index) : block.id,
+            ...config.repairBytes && block.arguments === '' ? { arguments: '{}' } : {},
+          },
+        }
+        continue
+      }
+    }
+
+    yield chunk
+  }
+}
+
+/**
  * The guard. Returns the upstream stream, or a cut stream that emits up to and
  * including the breaching chunk then a terminal `error` finish.
  *
@@ -291,12 +471,32 @@ export async function* guardStream(
 }
 
 /**
- * Register the guard. {@link guardStream} is a plain async generator, so the
- * registration is a direct delegate with no casts.
+ * Register the guard. Both passes are plain async generators, so the
+ * registration is a direct delegate with no casts. Identity repair runs first:
+ * it decides what the call *is* (and may cut the stream for `repair: 'error'`),
+ * then the byte/fragment/aggregate budgets measure the resulting stream.
  */
 export function apply(ctx: Context, config: ResolvedConfig): void {
+  // The schema defaults `repair`/`repairBytes`, but a caller that builds its own
+  // config object (custom profile layer, test) cannot rely on schemastery having
+  // run. Resolve once here so both the wiring and `ResolvedConfig`'s promise of
+  // "every field carries its validated default" hold.
+  const resolved: ResolvedConfig = {
+    ...config,
+    repair: config.repair ?? 'repair',
+    repairBytes: config.repairBytes ?? true,
+  }
   ctx.on('llm/stream', (options: GenerateOptions, next: () => AsyncIterable<StreamChunk>) => {
-    void options
-    return guardStream(next(), config)
+    const upstream = next()
+    if (resolved.repair === 'off') return guardStream(upstream, resolved)
+    const repaired = repairIdentityStream(upstream, resolved, (index, missing) => {
+      ctx.logger.warn(
+        'llm-tool-call-guard: tool-call at index %d streamed an empty %s; '
+        + 'substituted a synthetic call id to keep the session loadable (#6152)',
+        index,
+        missing.join(' and empty '),
+      )
+    })
+    return guardStream(repaired, resolved)
   })
 }
