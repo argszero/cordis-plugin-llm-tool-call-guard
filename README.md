@@ -86,6 +86,34 @@ The test suite includes a **boundary-exact recorded stream** from discussion #60
 `@luisnomad`. The fixture asserts the byte-only guard passes it unchanged (the blind spot) while
 the fragment guard correctly catches it.
 
+## Peer range
+
+The plugin declares `@deepseek-ai/dsh-llm` as a peer dependency with range:
+
+```
+>=0.1.2-rc.1 <0.2.0 || >=0.1.5-alpha.1 <0.2.0
+```
+
+Every dsh release published today is a prerelease (`0.1.2-rc.1`, `0.1.5-alpha.1`,
+`0.1.5-rc.1`, …), and a semver comparator only admits prereleases that share its own
+`major.minor.patch` tuple. Two failure modes follow, and both must be avoided:
+
+```jsonc
+// Matches nothing: 0.1.2-rc.1 is LOWER than 0.1.2, and every other
+// prerelease has a different tuple.
+">=0.1.2"
+
+// Only 0.1.2-rc.1: a 0.1.5-line user gets ERESOLVE.
+">=0.1.2-rc.1 <0.2.0"
+
+// What we ship: one comparator per supported tuple line.
+">=0.1.2-rc.1 <0.2.0 || >=0.1.5-alpha.1 <0.2.0"
+```
+
+The npm `latest` tag for `@deepseek-ai/dsh` is on the `0.1.2` line while `next`/`alpha`
+point at `0.1.5`, so both comparators are needed. v0.1.2 shipped the second form and
+rejected the `0.1.5` line (`ERESOLVE`); v0.1.3 fixes it.
+
 ## License
 
 MIT
